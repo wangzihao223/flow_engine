@@ -1,0 +1,381 @@
+// Multi-workflow tab management
+import { API_BASE } from './config.js';
+import { state, setModified, setWorkflowStopped, clearChangeTracking, saveActiveWorkflowToCache, restoreWorkflowFromCache } from './state.js';
+import { renderNode } from './nodes.js';
+import { updateConnections } from './connections.js';
+import { showToast } from './ui-utils.js';
+import { deselectAllNodes } from './selection.js';
+import { loadWorkflowData, enrichNodeWithTypeInfo } from './workflow.js';
+import { disconnectAllImageViewerPreviews } from './image_preview.js';
+import { startDebugPolling } from './debug.js';
+
+let switchingWorkflow = false;
+
+function restoreCachedWorkflow(workflowId) {
+    if (!restoreWorkflowFromCache(workflowId)) return false;
+    state.nodes.forEach(nodeData => renderNode(nodeData));
+    updateConnections();
+    setModified(state.isModified);
+    return true;
+}
+
+/**
+ * Initialize workflow tabs from the server.
+ */
+export async function initWorkflowTabs() {
+    try {
+        const response = await fetch(`${API_BASE}/workflows`);
+        if (!response.ok) throw new Error('Failed to load workflows');
+        const workflows = await response.json();
+        
+        state.workflows.clear();
+        let activeId = null;
+        
+        workflows.forEach(wf => {
+            state.workflows.set(wf.id, {
+                name: wf.name,
+                enabled: wf.enabled,
+                nodeCount: wf.nodeCount
+            });
+            if (wf.active) activeId = wf.id;
+        });
+
+        // Restore the transient "stopped" indicator across page reloads:
+        // if every enabled workflow's deployed engine is not running, the
+        // flows were stopped via the deploy menu.
+        const enabledWfs = workflows.filter(wf => wf.enabled);
+        setWorkflowStopped(enabledWfs.length > 0 &&
+            enabledWfs.every(wf => wf.running === false));
+
+        if (!activeId && state.workflows.size > 0) {
+            activeId = state.workflows.keys().next().value;
+        }
+        
+        state.activeWorkflowId = activeId;
+        renderTabs();
+    } catch (error) {
+        console.error('Failed to load workflows:', error);
+    }
+}
+
+/**
+ * Render the workflow tab bar.
+ */
+export function renderTabs() {
+    const container = document.getElementById('workflow-tabs');
+    if (!container) return;
+    
+    // Remove existing tabs (but keep the + button)
+    const addBtn = document.getElementById('add-workflow-btn');
+    container.querySelectorAll('.workflow-tab').forEach(el => el.remove());
+    
+    state.workflows.forEach((meta, wid) => {
+        const tab = document.createElement('button');
+        tab.className = 'workflow-tab';
+        if (wid === state.activeWorkflowId) tab.classList.add('active');
+        if (!meta.enabled) tab.classList.add('disabled');
+        tab.dataset.workflowId = wid;
+        
+        const nameSpan = document.createElement('span');
+        nameSpan.className = 'tab-name';
+        nameSpan.textContent = meta.name;
+        tab.appendChild(nameSpan);
+        
+        const closeBtn = document.createElement('span');
+        closeBtn.className = 'tab-close';
+        closeBtn.textContent = '×';
+        closeBtn.addEventListener('click', (e) => {
+            e.stopPropagation();
+            deleteWorkflow(wid);
+        });
+        tab.appendChild(closeBtn);
+        
+        // Single click: switch to workflow (if not active) or open properties (if active)
+        tab.addEventListener('click', (e) => {
+            if (e.target === closeBtn) return;
+            if (wid === state.activeWorkflowId) {
+                // Already active - open properties panel for workflow editing
+                showWorkflowProperties(wid);
+            } else {
+                switchWorkflow(wid);
+            }
+        });
+        
+        // Double click: start inline rename
+        tab.addEventListener('dblclick', (e) => {
+            e.stopPropagation();
+            startInlineRename(wid, nameSpan);
+        });
+        
+        container.insertBefore(tab, addBtn);
+    });
+}
+
+/**
+ * Switch to a different workflow tab.
+ */
+export async function switchWorkflow(workflowId) {
+    if (workflowId === state.activeWorkflowId) return true;
+    if (switchingWorkflow || !state.workflows.has(workflowId)) return false;
+
+    switchingWorkflow = true;
+    const previousId = state.activeWorkflowId;
+    let serverSwitched = false;
+    try {
+        const response = await fetch(`${API_BASE}/workflows/active`, {
+            method: 'PUT',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ workflowId })
+        });
+        if (!response.ok) throw new Error('Failed to set active workflow');
+        serverSwitched = true;
+
+        saveActiveWorkflowToCache();
+        disconnectAllImageViewerPreviews();
+        deselectAllNodes();
+        document.getElementById('nodes-container').innerHTML = '';
+        document.getElementById('connections').innerHTML = '';
+        state.activeWorkflowId = workflowId;
+
+        if (!restoreCachedWorkflow(workflowId)) await loadWorkflowData(workflowId);
+
+        const propertiesPanel = document.getElementById('properties-panel-container');
+        if (propertiesPanel) propertiesPanel.classList.add('hidden');
+        const { clearHistory } = await import('./history.js');
+        clearHistory();
+        startDebugPolling();
+        renderTabs();
+        return true;
+    } catch (error) {
+        console.error('Failed to switch workflow:', error);
+        if (serverSwitched && previousId) {
+            try {
+                await fetch(`${API_BASE}/workflows/active`, {
+                    method: 'PUT',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ workflowId: previousId })
+                });
+            } catch (rollbackError) {
+                console.error('Failed to restore active workflow:', rollbackError);
+            }
+        }
+        if (state.activeWorkflowId !== previousId) {
+            state.activeWorkflowId = previousId;
+            document.getElementById('nodes-container').innerHTML = '';
+            document.getElementById('connections').innerHTML = '';
+            restoreCachedWorkflow(previousId);
+        }
+        renderTabs();
+        showToast('Failed to switch workflow');
+        return false;
+    } finally {
+        switchingWorkflow = false;
+    }
+}
+
+/**
+ * Create a new workflow.
+ */
+export async function createNewWorkflow(name) {
+    try {
+        const response = await fetch(`${API_BASE}/workflows`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ name: name || 'New Workflow' })
+        });
+        
+        if (!response.ok) throw new Error('Failed to create workflow');
+        
+        const wf = await response.json();
+        state.workflows.set(wf.id, {
+            name: wf.name,
+            enabled: wf.enabled,
+            nodeCount: 0
+        });
+        
+        // Switch to the new workflow
+        if (!await switchWorkflow(wf.id)) return null;
+        showToast(`Created workflow: ${wf.name}`);
+        return wf;
+    } catch (error) {
+        console.error('Failed to create workflow:', error);
+        showToast('Failed to create workflow');
+        return null;
+    }
+}
+
+/**
+ * Delete a workflow.
+ */
+async function deleteWorkflow(workflowId) {
+    if (state.workflows.size <= 1) {
+        showToast('Cannot delete the last workflow');
+        return;
+    }
+    
+    const name = state.workflows.get(workflowId)?.name || 'this workflow';
+    if (!confirm(`Delete workflow "${name}"?`)) return;
+    
+    try {
+        const response = await fetch(`${API_BASE}/workflows/${workflowId}`, {
+            method: 'DELETE'
+        });
+        
+        if (!response.ok) throw new Error('Failed to delete workflow');
+        
+        const result = await response.json();
+        
+        // Remove from local state
+        state.workflows.delete(workflowId);
+        state.workflowCache.delete(workflowId);
+        
+        // If we deleted the active workflow, switch to what server says
+        if (workflowId === state.activeWorkflowId) {
+            state.activeWorkflowId = result.activeWorkflow;
+            disconnectAllImageViewerPreviews();
+            deselectAllNodes();
+            document.getElementById('nodes-container').innerHTML = '';
+            document.getElementById('connections').innerHTML = '';
+            if (!restoreCachedWorkflow(state.activeWorkflowId)) {
+                await loadWorkflowData(state.activeWorkflowId);
+            }
+            const propertiesPanel = document.getElementById('properties-panel-container');
+            if (propertiesPanel) propertiesPanel.classList.add('hidden');
+            const { clearHistory } = await import('./history.js');
+            clearHistory();
+            startDebugPolling();
+        }
+        
+        renderTabs();
+        showToast(`Deleted workflow: ${name}`);
+    } catch (error) {
+        console.error('Failed to delete workflow:', error);
+        showToast('Failed to delete workflow');
+    }
+}
+
+/**
+ * Start inline rename on a tab.
+ */
+function startInlineRename(workflowId, nameSpan) {
+    nameSpan.contentEditable = 'true';
+    nameSpan.focus();
+    
+    // Select all text
+    const range = document.createRange();
+    range.selectNodeContents(nameSpan);
+    const sel = window.getSelection();
+    sel.removeAllRanges();
+    sel.addRange(range);
+    
+    const finish = async () => {
+        nameSpan.contentEditable = 'false';
+        const newName = nameSpan.textContent.trim();
+        if (!newName) {
+            // Revert to old name
+            nameSpan.textContent = state.workflows.get(workflowId)?.name || 'Untitled';
+            return;
+        }
+        
+        try {
+            const response = await fetch(`${API_BASE}/workflows/${workflowId}`, {
+                method: 'PUT',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ name: newName })
+            });
+            
+            if (response.ok) {
+                const result = await response.json();
+                const meta = state.workflows.get(workflowId);
+                if (meta) meta.name = result.name;
+                nameSpan.textContent = result.name;
+            }
+        } catch (error) {
+            console.error('Failed to rename workflow:', error);
+        }
+    };
+    
+    nameSpan.addEventListener('blur', finish, { once: true });
+    nameSpan.addEventListener('keydown', (e) => {
+        if (e.key === 'Enter') {
+            e.preventDefault();
+            nameSpan.blur();
+        }
+        if (e.key === 'Escape') {
+            nameSpan.textContent = state.workflows.get(workflowId)?.name || 'Untitled';
+            nameSpan.contentEditable = 'false';
+        }
+    });
+}
+
+/**
+ * Show workflow properties in the properties panel.
+ */
+function showWorkflowProperties(workflowId) {
+    const meta = state.workflows.get(workflowId);
+    if (!meta) return;
+    
+    const panel = document.getElementById('properties-panel');
+    const container = document.getElementById('properties-panel-container');
+    
+    // Deselect any selected node
+    deselectAllNodes();
+    
+    panel.innerHTML = `
+        <div class="workflow-properties">
+            <div class="property-group">
+                <label class="property-label">Workflow Name</label>
+                <input type="text" class="property-input" id="wf-prop-name" value="${meta.name}" />
+            </div>
+            <div class="property-group">
+                <label class="property-label">
+                    <input type="checkbox" id="wf-prop-enabled" ${meta.enabled ? 'checked' : ''} />
+                    Enabled
+                </label>
+                <span class="property-hint">Disabled workflows won't run when deployed</span>
+            </div>
+        </div>
+    `;
+    
+    container.classList.remove('hidden');
+    
+    // Wire up change handlers
+    const nameInput = document.getElementById('wf-prop-name');
+    nameInput.addEventListener('change', async () => {
+        const newName = nameInput.value.trim();
+        if (!newName) return;
+        try {
+            const response = await fetch(`${API_BASE}/workflows/${workflowId}`, {
+                method: 'PUT',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ name: newName })
+            });
+            if (response.ok) {
+                const result = await response.json();
+                meta.name = result.name;
+                nameInput.value = result.name;
+                renderTabs();
+            }
+        } catch (error) {
+            console.error('Failed to update workflow name:', error);
+        }
+    });
+    
+    const enabledCheckbox = document.getElementById('wf-prop-enabled');
+    enabledCheckbox.addEventListener('change', async () => {
+        try {
+            const response = await fetch(`${API_BASE}/workflows/${workflowId}`, {
+                method: 'PUT',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ enabled: enabledCheckbox.checked })
+            });
+            if (response.ok) {
+                const result = await response.json();
+                meta.enabled = result.enabled;
+                renderTabs();
+            }
+        } catch (error) {
+            console.error('Failed to update workflow enabled state:', error);
+        }
+    });
+}

@@ -1,0 +1,15 @@
+{
+  "activeWorkflow": "default",
+  "version": 2,
+  "workflows": [
+    {
+      "definition": {
+        "connections": [],
+        "nodes": []
+      },
+      "enabled": true,
+      "id": "default",
+      "name": "Default Workflow"
+    }
+  ]
+}

@@ -1,0 +1,1151 @@
+// Node rendering and management
+import { API_BASE } from './config.js';
+import { state, generateNodeId, markNodeModified, markNodeAdded, markNodeDeleted, markConnectionDeleted, setModified, getNodeType } from './state.js';
+import { updateConnections, nodeHasConnections, getConnectionAtPoint, highlightConnectionForInsert, clearConnectionHighlight, getHoveredConnection, insertNodeIntoConnection } from './connections.js';
+import { selectNode, selectPathBetweenNodes } from './selection.js';
+import { clientToCanvas, getZoom } from './viewport.js';
+import { refreshMinimap } from './minimap.js';
+import { connectImageViewerPreview, disconnectImageViewerPreview } from './image_preview.js';
+
+const GRID_SIZE = 20;
+
+function clampToCanvasBounds(x, y) {
+    // Keep nodes within the drawable canvas area (best-effort).
+    const min = 0;
+    const maxX = 5000;
+    const maxY = 5000;
+    return {
+        x: Math.min(Math.max(x, min), maxX),
+        y: Math.min(Math.max(y, min), maxY)
+    };
+}
+
+/**
+ * Get the center of the snap anchor port in canvas coordinates.
+ * For nodes with inputs: uses input port 0
+ * For output-only nodes: uses output port 0
+ */
+function getSnapAnchorPortCenter(nodeEl) {
+    const nodesContainer = document.getElementById('nodes-container');
+    if (!nodesContainer) return null;
+
+    // Try input port 0 first
+    let portEl = nodeEl.querySelector('.port.input[data-index="0"]') || nodeEl.querySelector('.port.input');
+    
+    // If no input port, use output port 0 (for output-only nodes like Inject, Camera, etc.)
+    if (!portEl) {
+        portEl = nodeEl.querySelector('.port.output[data-index="0"]') || nodeEl.querySelector('.port.output');
+    }
+    
+    if (!portEl) return null;
+
+    // Port center in canvas coordinates (zoom-aware)
+    const portRect = portEl.getBoundingClientRect();
+    return clientToCanvas(
+        portRect.left + portRect.width / 2,
+        portRect.top + portRect.height / 2
+    );
+}
+
+export function snapNodeToGrid(nodeId, gridSize = GRID_SIZE) {
+    const nodeData = state.nodes.get(nodeId);
+    const nodeEl = document.getElementById(`node-${nodeId}`);
+    if (!nodeData || !nodeEl) return false;
+
+    const portCenter = getSnapAnchorPortCenter(nodeEl);
+    if (!portCenter) return false;
+
+    const snappedX = Math.round(portCenter.x / gridSize) * gridSize;
+    const snappedY = Math.round(portCenter.y / gridSize) * gridSize;
+    const deltaX = snappedX - portCenter.x;
+    const deltaY = snappedY - portCenter.y;
+
+    if (deltaX === 0 && deltaY === 0) return true;
+
+    const next = clampToCanvasBounds(nodeData.x + deltaX, nodeData.y + deltaY);
+    nodeData.x = next.x;
+    nodeData.y = next.y;
+    nodeEl.style.left = `${nodeData.x}px`;
+    nodeEl.style.top = `${nodeData.y}px`;
+    updateConnections();
+    return true;
+}
+
+function snapSelectedNodesToGrid(anchorNodeId, gridSize = GRID_SIZE) {
+    const anchorEl = document.getElementById(`node-${anchorNodeId}`);
+    if (!anchorEl) return;
+
+    const anchorPortCenter = getSnapAnchorPortCenter(anchorEl);
+    if (!anchorPortCenter) return;
+
+    const snappedX = Math.round(anchorPortCenter.x / gridSize) * gridSize;
+    const snappedY = Math.round(anchorPortCenter.y / gridSize) * gridSize;
+    const deltaX = snappedX - anchorPortCenter.x;
+    const deltaY = snappedY - anchorPortCenter.y;
+
+    if (deltaX === 0 && deltaY === 0) return;
+
+    state.selectedNodes.forEach(selectedId => {
+        const selectedNodeData = state.nodes.get(selectedId);
+        const selectedNodeEl = document.getElementById(`node-${selectedId}`);
+        if (!selectedNodeData || !selectedNodeEl) return;
+
+        const next = clampToCanvasBounds(selectedNodeData.x + deltaX, selectedNodeData.y + deltaY);
+        selectedNodeData.x = next.x;
+        selectedNodeData.y = next.y;
+        selectedNodeEl.style.left = `${selectedNodeData.x}px`;
+        selectedNodeEl.style.top = `${selectedNodeData.y}px`;
+    });
+
+    updateConnections();
+}
+
+/**
+ * Generate a unique name for a node by checking existing node names
+ */
+export function generateUniqueName(baseName, nodeType = null) {
+    // Extract base name without number suffix (e.g., "debug 2" -> "debug")
+    let cleanBaseName = baseName;
+    const match = baseName.match(/^(.+?)\s+(\d+)$/);
+    if (match) {
+        cleanBaseName = match[1];
+    }
+    
+    let uniqueName = cleanBaseName;
+    let counter = 1;
+    
+    // Check if name already exists
+    const existingNames = new Set();
+    state.nodes.forEach(node => {
+        // If nodeType is provided, only check nodes of the same type
+        if (!nodeType || node.type === nodeType) {
+            existingNames.add(node.name.toLowerCase());
+        }
+    });
+    
+    // If base name exists, try with numbers
+    while (existingNames.has(uniqueName.toLowerCase())) {
+        counter++;
+        uniqueName = `${cleanBaseName} ${counter}`;
+    }
+    
+    return uniqueName;
+}
+
+export function createNode(type, x, y) {
+    const nodeType = getNodeType(type);
+    const displayName = nodeType ? nodeType.name : type;
+    
+    // Generate unique name by checking existing nodes
+    const uniqueName = generateUniqueName(displayName, type);
+
+    
+    // Save state before creating node
+    import('./history.js').then(({ saveState }) => {
+        saveState('create node');
+    });
+    
+    // Initialize config with default values from properties
+    // Use structuredClone to avoid sharing array/object references between node instances
+    const config = {};
+    if (nodeType && nodeType.properties) {
+        for (const prop of nodeType.properties) {
+            if (prop.default !== undefined) {
+                config[prop.name] = structuredClone(prop.default);
+            }
+        }
+    }
+    
+    const nodeData = {
+        id: generateNodeId(),
+        type: type,
+        name: uniqueName,
+        config: config,
+        x: x,
+        y: y
+    };
+    
+    if (nodeType) {
+        nodeData.color = nodeType.color;
+        nodeData.borderColor = nodeType.borderColor;
+        nodeData.textColor = nodeType.textColor;
+        nodeData.icon = nodeType.icon;
+        nodeData.inputCount = nodeType.inputCount;
+        nodeData.outputCount = nodeType.outputCount;
+    }
+    
+    state.nodes.set(nodeData.id, nodeData);
+    renderNode(nodeData);
+    markNodeAdded(nodeData.id);
+    markNodeModified(nodeData.id);
+    setModified(true);
+    
+    return nodeData.id;
+}
+
+// Track z-index for node layering
+let nodeZIndex = 1;
+
+export function renderNode(nodeData) {
+    const nodeEl = document.createElement('div');
+    nodeEl.className = 'node';
+    nodeEl.id = `node-${nodeData.id}`;
+    nodeEl.style.left = `${nodeData.x}px`;
+    nodeEl.style.top = `${nodeData.y}px`;
+    nodeEl.style.zIndex = nodeZIndex++;
+    
+    // Add special class for ImageViewerNode
+    if (nodeData.type === 'ImageViewerNode') {
+        nodeEl.classList.add('image-viewer-node');
+    }
+    
+    // Add special class for unknown/placeholder nodes
+    if (nodeData.isUnknownNode) {
+        nodeEl.classList.add('unknown-node');
+    }
+    
+    // Add disabled class if node is disabled
+    if (nodeData.enabled === false) {
+        nodeEl.classList.add('disabled');
+    }
+    
+    // Apply custom colors
+    if (nodeData.color) nodeEl.style.backgroundColor = nodeData.color;
+    if (nodeData.borderColor) nodeEl.style.borderColor = nodeData.borderColor;
+    if (nodeData.textColor) nodeEl.style.color = nodeData.textColor;
+    
+    const inputCount = nodeData.inputCount !== undefined ? nodeData.inputCount : 1;
+    const outputCount = nodeData.outputCount !== undefined ? nodeData.outputCount : 1;
+    
+    // Calculate and apply dynamic height based on port count (whichever is larger)
+    const maxPorts = Math.max(inputCount, outputCount);
+    if (maxPorts > 1) {
+        // Base height (30px) + additional height for extra ports
+        // Each port is 10px + 4px gap, need at least 14px per port after the first
+        const extraHeight = (maxPorts - 1) * 14;
+        const totalHeight = 30 + extraHeight;
+        nodeEl.style.minHeight = `${totalHeight}px`;
+    }
+    const icon = nodeData.icon || '◆';
+    
+    // Build node content HTML
+    let nodeContent = buildNodeContent(nodeData, icon, inputCount, outputCount);
+    
+    // Generate ports HTML with support for multiple inputs and outputs
+    let portsHtml = '';
+    if (inputCount > 0 || outputCount > 0) {
+        let inputPortsHtml = '';
+        if (inputCount > 0) {
+            if (inputCount === 1) {
+                inputPortsHtml = `<div class="port input" data-node="${nodeData.id}" data-type="input" data-index="0"></div>`;
+            } else {
+                // Multiple inputs - stack them vertically
+                inputPortsHtml = '<div class="input-ports-container">';
+                for (let i = 0; i < inputCount; i++) {
+                    inputPortsHtml += `<div class="port input" data-node="${nodeData.id}" data-type="input" data-index="${i}"></div>`;
+                }
+                inputPortsHtml += '</div>';
+            }
+        }
+        
+        let outputPortsHtml = '';
+        if (outputCount > 0) {
+            if (outputCount === 1) {
+                outputPortsHtml = `<div class="port output" data-node="${nodeData.id}" data-type="output" data-index="0"></div>`;
+            } else {
+                // Multiple outputs - stack them vertically
+                outputPortsHtml = '<div class="output-ports-container">';
+                for (let i = 0; i < outputCount; i++) {
+                    outputPortsHtml += `<div class="port output" data-node="${nodeData.id}" data-type="output" data-index="${i}"></div>`;
+                }
+                outputPortsHtml += '</div>';
+            }
+        }
+        
+        portsHtml = `
+            <div class="node-ports">
+                ${inputPortsHtml}
+                ${outputPortsHtml}
+            </div>
+        `;
+    }
+    
+    let imageViewerHtml = '';
+    if (nodeData.type === 'ImageViewerNode') {
+        const width = nodeData.config?.width || 320;
+        const height = nodeData.config?.height || 240;
+        imageViewerHtml = `
+            <div class="image-viewer-container" id="viewer-container-${nodeData.id}" style="width: ${width}px; height: ${height}px;">
+                <img id="viewer-${nodeData.id}" class="image-viewer-frame" alt="No frame" />
+                <div id="viewer-stats-${nodeData.id}" class="image-viewer-stats">idle</div>
+                <div class="image-viewer-resize-handle" data-node="${nodeData.id}"></div>
+            </div>
+        `;
+    }
+    
+    nodeEl.innerHTML = `
+        <div class="node-modified-indicator"></div>
+        ${nodeContent}
+        ${portsHtml}
+        ${imageViewerHtml}
+    `;
+    
+    attachNodeEventHandlers(nodeEl, nodeData);
+    document.getElementById('nodes-container').appendChild(nodeEl);
+
+    if (nodeData.type === 'ImageViewerNode') {
+        connectImageViewerPreview(nodeData.id);
+    }
+
+    // Covers node create, paste, import and tab-switch re-render paths
+    refreshMinimap();
+}
+
+function buildNodeContent(nodeData, icon, inputCount, outputCount) {
+    const nodeType = getNodeType(nodeData.type);
+    const uiComponent = nodeType?.uiComponent;
+    const uiConfig = nodeType?.uiComponentConfig || {};
+    
+    // Build the base content structure
+    let contentParts = {
+        left: '',
+        center: '',
+        right: '',
+        below: ''
+    };
+    
+    // Icon always in center-left
+    contentParts.center = `<div class="node-icon-container"><div class="node-icon">${icon}</div></div>`;
+    
+    // Title always in center
+    contentParts.center += `<div class="node-title">${nodeData.name}</div>`;
+    
+    // Add UI component based on type
+    if (uiComponent === 'button') {
+        // Button on the left (like InjectNode)
+        const buttonIcon = uiConfig.icon || '▶';
+        const action = uiConfig.action || 'inject';
+        const tooltip = uiConfig.tooltip || 'Trigger';
+        contentParts.left = `<button class="inject-btn" onclick="window.nodeAction('${nodeData.id}', '${action}')" title="${tooltip}">${buttonIcon}</button>`;
+    } else if (uiComponent === 'toggle') {
+        // Toggle switch on the right (like GateNode, DebugNode, DrawPredictionsNode)
+        const action = uiConfig.action || 'toggle';
+        const stateField = uiConfig.stateField;
+        const isChecked = stateField
+            ? nodeData[stateField] !== false
+            : nodeData.enabled !== false && nodeData.drawingEnabled !== false;
+        const modeDisplay = uiConfig.modeDisplay
+            ? `<span class="mode-display" id="mode-display-${nodeData.id}">${escapeHtmlModeLabel(getModeLabel(nodeData, nodeData.mode !== 'b' && nodeData.modeA !== false))}</span>`
+            : '';
+        contentParts.right = `
+            ${modeDisplay}
+            <label class="gate-switch">
+                <input type="checkbox" id="toggle-${nodeData.id}" ${isChecked ? 'checked' : ''} 
+                       onchange="window.nodeAction('${nodeData.id}', '${action}', this.checked)">
+                <span class="gate-slider"></span>
+            </label>
+        `;
+    } else if (uiComponent === 'text-display') {
+        const config = nodeData.config || {};
+        const text = nodeData.displayText ?? config.default_text ?? uiConfig.default ?? '';
+        contentParts.right = `<div class="text-display" id="text-display-${nodeData.id}">${escapeHtmlModeLabel(text)}</div>`;
+    } else if (uiComponent === 'rate-display') {
+        // Rate display on the right (like RateProbeNode)
+        const format = uiConfig.format || '{value}';
+        contentParts.right = `<div class="rate-display" id="rate-${nodeData.id}">0/s</div>`;
+    } else if (uiComponent === 'queue-length-display') {
+        // Queue length display on the right (like QueueLengthProbeNode)
+        const format = uiConfig.format || '{value} queued';
+        contentParts.right = `<div class="queue-length-display" id="queue-${nodeData.id}">0 queued</div>`;
+    } else if (uiComponent === 'counter-display') {
+        // Counter display with reset button (like CounterNode)
+        const action = uiConfig.action || 'reset_counter';
+        contentParts.left = `<button class="inject-btn" onclick="window.nodeAction('${nodeData.id}', '${action}')" title="${uiConfig.tooltip || 'Reset'}">↻</button>`;
+        contentParts.right = `<div class="counter-display" id="counter-${nodeData.id}">0</div>`;
+    } else if (uiComponent === 'config-badge') {
+        const key = uiConfig.key;
+        const prefix = uiConfig.prefix || '';
+        const placeholder = uiConfig.placeholder || '';
+        const raw = (nodeData.config && nodeData.config[key]) || '';
+        const text = raw ? `${prefix}${raw}` : placeholder;
+        contentParts.right = `<div class="node-config-badge" id="config-badge-${nodeData.id}" data-key="${key}" data-prefix="${prefix}" data-placeholder="${placeholder}">${text}</div>`;
+    } else if (uiComponent === 'image-drop') {
+        // Drop zone indicator on the left (like ImageUploadNode), with an
+        // inject-style button that sends the uploaded image on demand.
+        const tooltip = uiConfig.tooltip || 'Drop an image here';
+        const sendAction = uiConfig.send_action;
+        const sendBtn = sendAction
+            ? `<button class="inject-btn" onclick="window.nodeAction('${nodeData.id}', '${sendAction}')" title="${uiConfig.send_tooltip || 'Send'}">▶</button>`
+            : '';
+        contentParts.left = `${sendBtn}<div class="image-drop-zone" id="drop-${nodeData.id}" title="${tooltip}">📂</div>`;
+    } else if (uiComponent === 'transport-controls') {
+        // Generic transport/button strip (like VideoReaderNode).
+        // Buttons come from uiComponentConfig.buttons: [{icon, action, title}]
+        // and each POSTs its action to /api/nodes/<id>/<action>.
+        const buttons = (uiConfig.buttons || []).map(btn =>
+            `<button class="transport-btn" onclick="window.nodeAction('${nodeData.id}', '${btn.action}')" title="${btn.title || btn.action}">${btn.icon}</button>`
+        ).join('');
+        contentParts.right = `
+            <div class="transport-controls">
+                ${buttons}
+                <span class="transport-pos" id="transport-pos-${nodeData.id}">-/-</span>
+            </div>
+        `;
+        // Full-width progress/scrub slider along the bottom of the node.
+        // `oninput` previews the position while dragging; `onchange` (on
+        // release) issues the seek. The node-drag handler ignores this
+        // element so grabbing the thumb doesn't move the node.
+        contentParts.below = `
+            <input type="range" class="transport-progress"
+                   id="transport-progress-${nodeData.id}"
+                   min="0" max="0" value="0" step="1" title="Seek"
+                   oninput="window.videoSeekPreview('${nodeData.id}', this.value)"
+                   onchange="window.videoSeek('${nodeData.id}', this.value)" />
+        `;
+    } else if (uiComponent === 'slider') {
+        // Interactive value slider (ControlSliderNode): a range input along the
+        // bottom of the node whose live value is POSTed to the deployed node
+        // (set_value action) on drag, and persisted to config on release.
+        // Range/step/value come from the node's own config so the properties
+        // panel can tune them.
+        const cfg = nodeData.config || {};
+        const pick = (k, d) => (cfg[k] !== undefined ? cfg[k]
+                                : (uiConfig[k] !== undefined ? uiConfig[k] : d));
+        const min = pick('min', 0);
+        const max = pick('max', 1);
+        const step = pick('step', 0.01);
+        const value = cfg.value !== undefined ? cfg.value : min;
+        const label = cfg.label || '';
+        const labelHtml = label
+            ? `<span class="control-slider-label" id="slider-label-${nodeData.id}">${label}</span>`
+            : '';
+        contentParts.right = `<div class="control-slider-value" id="slider-val-${nodeData.id}">${value}</div>`;
+        contentParts.below = `
+            <div class="control-slider-row">
+                ${labelHtml}
+                <input type="range" class="control-slider"
+                       id="slider-${nodeData.id}"
+                       min="${min}" max="${max}" step="${step}" value="${value}"
+                       title="Drag to set value"
+                       oninput="window.controlSliderInput('${nodeData.id}', this.value)"
+                       onchange="window.controlSliderCommit('${nodeData.id}', this.value)" />
+            </div>
+        `;
+    }
+    
+    // Combine parts based on input/output configuration
+    if (inputCount === 0 && outputCount > 0) {
+        // Input node - button/icon on left
+        return `<div class="node-content">${contentParts.left}${contentParts.center}${contentParts.right}</div>${contentParts.below}`;
+    } else if (inputCount > 0 && outputCount === 0) {
+        // Output node - title first, then icon, then controls
+        return `<div class="node-content">${contentParts.center}${contentParts.right}</div>${contentParts.below}`;
+    } else {
+        // Processing node - standard layout
+        return `<div class="node-content">${contentParts.left}${contentParts.center}${contentParts.right}</div>${contentParts.below}`;
+    }
+}
+
+function getModeLabel(nodeData, modeA) {
+    const config = nodeData.config || {};
+    const fallback = modeA ? '模式 A' : '模式 B';
+    const label = modeA ? config.mode_a_name : config.mode_b_name;
+    return String(label || fallback);
+}
+
+function escapeHtmlModeLabel(label) {
+    return String(label)
+        .replace(/&/g, '&amp;')
+        .replace(/</g, '&lt;')
+        .replace(/>/g, '&gt;')
+        .replace(/"/g, '&quot;')
+        .replace(/'/g, '&#039;');
+}
+
+function attachNodeEventHandlers(nodeEl, nodeData) {
+    let isDragging = false;
+    let startX, startY;
+    let hasMoved = false;
+    let wasDragged = false;
+    let isUnconnectedNode = false;
+    let snapAnchorPortOffset = null;
+    
+    nodeEl.addEventListener('mousedown', (e) => {
+        if (e.target.classList.contains('port')) return;
+        // Don't start a node drag when the user grabs a range slider (video
+        // scrub bar or a control-slider node) - let the input handle the drag.
+        if (e.target.classList.contains('transport-progress')) return;
+        if (e.target.classList.contains('control-slider')) return;
+        
+        // Only handle left mouse button (button === 0) for node selection and dragging
+        if (e.button !== 0) return;
+
+        // e.preventDefault() below suppresses the browser's default focus shift,
+        // which would otherwise leave focus stuck in the palette search or a
+        // properties-panel input - silently swallowing the Delete key
+        // (see the isEditingInput guard in events.js). Blur any focused form
+        // field outside this node so keyboard shortcuts target the canvas.
+        const activeEl = document.activeElement;
+        if (activeEl && activeEl !== document.body && !nodeEl.contains(activeEl) &&
+            typeof activeEl.blur === 'function') {
+            activeEl.blur();
+        }
+
+        // Bring node to front
+        nodeEl.style.zIndex = nodeZIndex++;
+        
+        isDragging = true;
+        hasMoved = false;
+        // Pointer offset from the node origin, in CANVAS coordinates so
+        // dragging tracks the cursor 1:1 at every zoom level.
+        const pointerCanvas = clientToCanvas(e.clientX, e.clientY);
+        startX = pointerCanvas.x - nodeData.x;
+        startY = pointerCanvas.y - nodeData.y;
+
+        // Cache the offset from node top-left to snap anchor port center (in canvas/container coords).
+        // For nodes with inputs: uses input port 0
+        // For output-only nodes: uses output port 0
+        // This lets us snap without forcing repeated DOM reads for the port each frame.
+        const portCenter = getSnapAnchorPortCenter(nodeEl);
+        if (portCenter) {
+            snapAnchorPortOffset = {
+                x: portCenter.x - nodeData.x,
+                y: portCenter.y - nodeData.y
+            };
+        } else {
+            snapAnchorPortOffset = null;
+        }
+        
+        // Check if this node has no connections (for hover-insert highlighting)
+        isUnconnectedNode = !nodeHasConnections(nodeData.id);
+        
+        if (e.shiftKey && state.selectedNodes.size === 1) {
+            // Shift+click with one node selected: select the path between them
+            const firstSelectedId = state.selectedNodes.values().next().value;
+            if (firstSelectedId !== nodeData.id) {
+                selectPathBetweenNodes(firstSelectedId, nodeData.id);
+            }
+        } else if (e.ctrlKey || e.metaKey) {
+            selectNode(nodeData.id, true);
+        } else if (!state.selectedNodes.has(nodeData.id)) {
+            selectNode(nodeData.id, false);
+        }
+        
+        e.preventDefault();
+    });
+    
+    nodeEl.addEventListener('click', (e) => {
+        if (wasDragged || e.ctrlKey || e.metaKey || e.shiftKey || state.selectedNodes.size !== 1) {
+            wasDragged = false;
+            return;
+        }
+        if (e.target.closest('button, input, select, textarea, label, a, .port, .image-drop-zone, .image-viewer-resize-handle')) return;
+        import('./properties.js').then(({ renderProperties }) => renderProperties(nodeData));
+    });
+
+    // Double-click to open properties
+    nodeEl.addEventListener('dblclick', (e) => {
+        if (e.target.classList.contains('port')) return;
+        // Don't open the config panel when double-clicking an interactive
+        // control on the node (buttons, toggles, inputs, drop zones, resize
+        // handle) - only the non-interactive node body should open it.
+        if (e.target.closest(
+            'button, input, select, textarea, label, a, ' +
+            '.image-drop-zone, .image-viewer-resize-handle'
+        )) return;
+
+        // Select the node if not already selected
+        if (!state.selectedNodes.has(nodeData.id)) {
+            selectNode(nodeData.id, false);
+        }
+        
+        // Show properties panel and render properties
+        import('./properties.js').then(({ renderProperties }) => {
+            renderProperties(nodeData);
+        });
+        
+        e.preventDefault();
+    });
+    
+    document.addEventListener('mousemove', (e) => {
+        if (!isDragging) return;
+        
+        if (!hasMoved) {
+            // Save state when movement starts
+            hasMoved = true;
+            import('./history.js').then(({ saveState }) => {
+                saveState('move node');
+            });
+        }
+        
+        // Desired anchor node position from pointer (canvas coordinates)
+        const pointerCanvas = clientToCanvas(e.clientX, e.clientY);
+        let nextAnchorX = pointerCanvas.x - startX;
+        let nextAnchorY = pointerCanvas.y - startY;
+
+        // Snap so the anchor port center lands on the nearest grid intersection.
+        if (snapAnchorPortOffset) {
+            const desiredPortX = nextAnchorX + snapAnchorPortOffset.x;
+            const desiredPortY = nextAnchorY + snapAnchorPortOffset.y;
+            const snappedPortX = Math.round(desiredPortX / GRID_SIZE) * GRID_SIZE;
+            const snappedPortY = Math.round(desiredPortY / GRID_SIZE) * GRID_SIZE;
+            nextAnchorX = snappedPortX - snapAnchorPortOffset.x;
+            nextAnchorY = snappedPortY - snapAnchorPortOffset.y;
+        } else {
+            // Fallback: no input port 0, snap the node top-left.
+            nextAnchorX = Math.round(nextAnchorX / GRID_SIZE) * GRID_SIZE;
+            nextAnchorY = Math.round(nextAnchorY / GRID_SIZE) * GRID_SIZE;
+        }
+
+        const clampedAnchor = clampToCanvasBounds(nextAnchorX, nextAnchorY);
+        nextAnchorX = clampedAnchor.x;
+        nextAnchorY = clampedAnchor.y;
+
+        const deltaX = nextAnchorX - nodeData.x;
+        const deltaY = nextAnchorY - nodeData.y;
+        
+        state.selectedNodes.forEach(selectedId => {
+            const selectedNodeData = state.nodes.get(selectedId);
+            const selectedNodeEl = document.getElementById(`node-${selectedId}`);
+            if (selectedNodeData && selectedNodeEl) {
+                const next = clampToCanvasBounds(selectedNodeData.x + deltaX, selectedNodeData.y + deltaY);
+                selectedNodeData.x = next.x;
+                selectedNodeData.y = next.y;
+                selectedNodeEl.style.left = `${selectedNodeData.x}px`;
+                selectedNodeEl.style.top = `${selectedNodeData.y}px`;
+                // Mark as modified when moved
+                markNodeModified(selectedId);
+                setModified(true);
+            }
+        });
+
+        nodeData.x = nextAnchorX;
+        nodeData.y = nextAnchorY;
+
+        updateConnections();
+
+        // Check for connection hover if this is an unconnected node
+        // Must happen after updateConnections() to ensure highlight persists
+        if (isUnconnectedNode && state.selectedNodes.size === 1) {
+            // Get node center position in canvas coordinates (zoom-aware)
+            const nodeRect = nodeEl.getBoundingClientRect();
+            const nodeCenter = clientToCanvas(
+                nodeRect.left + nodeRect.width / 2,
+                nodeRect.top + nodeRect.height / 2
+            );
+
+            const hoveredConnection = getConnectionAtPoint(nodeCenter.x, nodeCenter.y, 15 / getZoom());
+            if (hoveredConnection) {
+                highlightConnectionForInsert(hoveredConnection);
+            } else {
+                clearConnectionHighlight();
+            }
+        }
+    });
+    
+    document.addEventListener('mouseup', () => {
+        if (isDragging) {
+            wasDragged = hasMoved;
+            // Check if we should insert this node into a connection
+            const connectionToInsertInto = getHoveredConnection();
+            
+            // Clear any connection highlight when drag ends
+            clearConnectionHighlight();
+            
+            // If this was an unconnected node dropped on a connection, insert it
+            if (isUnconnectedNode && connectionToInsertInto) {
+                insertNodeIntoConnection(nodeData.id, connectionToInsertInto);
+            }
+
+            // Snap the moved selection so anchor input port 0 aligns to the grid.
+            if (hasMoved) {
+                snapSelectedNodesToGrid(nodeData.id);
+            }
+        }
+        isDragging = false;
+        hasMoved = false;
+        isUnconnectedNode = false;
+        snapAnchorPortOffset = null;
+    });
+    
+    // Port connection handling - support multiple output ports
+    const outputPorts = nodeEl.querySelectorAll('.port.output');
+    outputPorts.forEach(outputPort => {
+        outputPort.addEventListener('mousedown', (e) => {
+            e.stopPropagation();
+            const outputIndex = parseInt(outputPort.getAttribute('data-index') || '0');
+            // Import dynamically to avoid circular dependency
+            import('./connections.js').then(({ startConnection }) => {
+                startConnection(nodeData.id, e, outputIndex);
+            });
+        });
+    });
+    
+    // Add mouseup handlers on input ports for connection targeting (forward connection)
+    const inputPorts = nodeEl.querySelectorAll('.port.input');
+    inputPorts.forEach(inputPort => {
+        // Mouseup for completing forward connections (output -> input)
+        inputPort.addEventListener('mouseup', (e) => {
+            if (state.drawingConnection && !state.drawingConnection.backward && 
+                state.drawingConnection.sourceId !== nodeData.id) {
+                e.stopPropagation();
+                const inputIndex = parseInt(inputPort.getAttribute('data-index') || '0');
+                import('./connections.js').then(({ endConnection }) => {
+                    endConnection(nodeData.id, inputIndex);
+                });
+            }
+        });
+        
+        // Mousedown for starting backward connections (input -> output)
+        inputPort.addEventListener('mousedown', (e) => {
+            e.stopPropagation();
+            const inputIndex = parseInt(inputPort.getAttribute('data-index') || '0');
+            import('./connections.js').then(({ startBackwardConnection }) => {
+                startBackwardConnection(nodeData.id, e, inputIndex);
+            });
+        });
+    });
+    
+    // Add mouseup handlers on output ports for completing backward connections
+    outputPorts.forEach(outputPort => {
+        outputPort.addEventListener('mouseup', (e) => {
+            if (state.drawingConnection && state.drawingConnection.backward &&
+                state.drawingConnection.targetId !== nodeData.id) {
+                e.stopPropagation();
+                const outputIndex = parseInt(outputPort.getAttribute('data-index') || '0');
+                import('./connections.js').then(({ endBackwardConnection }) => {
+                    endBackwardConnection(nodeData.id, outputIndex);
+                });
+            }
+        });
+    });
+    
+    // Also keep the node-level handler for dropping on the node body (defaults to input 0)
+    nodeEl.addEventListener('mouseup', (e) => {
+        if (state.drawingConnection && !state.drawingConnection.backward &&
+            state.drawingConnection.sourceId !== nodeData.id) {
+            // Only handle if not already handled by an input port
+            if (!e.target.classList.contains('port')) {
+                e.stopPropagation();
+                import('./connections.js').then(({ endConnection }) => {
+                    endConnection(nodeData.id, 0);
+                });
+            }
+        }
+    });
+    
+    // Image upload drag-and-drop handler
+    const nodeType = getNodeType(nodeData.type);
+    if (nodeType?.uiComponent === 'image-drop') {
+        const dropZone = nodeEl.querySelector('.image-drop-zone');
+
+        const preventAndHighlight = (e) => {
+            e.preventDefault();
+            e.stopPropagation();
+            nodeEl.classList.add('image-drop-active');
+        };
+
+        nodeEl.addEventListener('dragover', preventAndHighlight);
+        nodeEl.addEventListener('dragenter', preventAndHighlight);
+
+        nodeEl.addEventListener('dragleave', (e) => {
+            e.preventDefault();
+            e.stopPropagation();
+            // Only remove highlight when actually leaving the node
+            if (!nodeEl.contains(e.relatedTarget)) {
+                nodeEl.classList.remove('image-drop-active');
+            }
+        });
+
+        nodeEl.addEventListener('drop', (e) => {
+            e.preventDefault();
+            e.stopPropagation();
+            nodeEl.classList.remove('image-drop-active');
+
+            const files = e.dataTransfer?.files;
+            if (!files || files.length === 0) return;
+
+            const file = files[0];
+            if (!file.type.startsWith('image/')) {
+                console.warn('Dropped file is not an image:', file.type);
+                return;
+            }
+
+            window.uploadImageToNode(nodeData.id, file);
+        });
+
+        // Also allow clicking the drop zone to open a file picker
+        if (dropZone) {
+            dropZone.addEventListener('click', (e) => {
+                e.stopPropagation();
+                const input = document.createElement('input');
+                input.type = 'file';
+                input.accept = 'image/*';
+                input.onchange = (ev) => {
+                    const file = ev.target.files[0];
+                    if (file) window.uploadImageToNode(nodeData.id, file);
+                };
+                input.click();
+            });
+        }
+    }
+
+    // Image viewer resize handler
+    if (nodeData.type === 'ImageViewerNode') {
+        const resizeHandle = nodeEl.querySelector('.image-viewer-resize-handle');
+        const viewerContainer = nodeEl.querySelector('.image-viewer-container');
+        
+        if (resizeHandle && viewerContainer) {
+            let isResizing = false;
+            let startWidth, startHeight, startX, startY;
+            
+            resizeHandle.addEventListener('mousedown', (e) => {
+                e.stopPropagation();
+                e.preventDefault();
+                
+                isResizing = true;
+                startWidth = viewerContainer.offsetWidth;
+                startHeight = viewerContainer.offsetHeight;
+                startX = e.clientX;
+                startY = e.clientY;
+                
+                document.body.style.cursor = 'nwse-resize';
+            });
+            
+            const handleResize = (e) => {
+                if (!isResizing) return;
+
+                // Viewer size is in canvas px; convert the client-px mouse
+                // delta so resizing tracks the cursor at every zoom level.
+                const zoom = getZoom();
+                const deltaX = (e.clientX - startX) / zoom;
+                const deltaY = (e.clientY - startY) / zoom;
+
+                const newWidth = Math.max(160, startWidth + deltaX);
+                const newHeight = Math.max(120, startHeight + deltaY);
+                
+                viewerContainer.style.width = `${newWidth}px`;
+                viewerContainer.style.height = `${newHeight}px`;
+                
+                // Update config for persistence
+                nodeData.config.width = newWidth;
+                nodeData.config.height = newHeight;
+                
+                // Mark as modified
+                markNodeModified(nodeData.id);
+                setModified(true);
+            };
+            
+            const stopResize = () => {
+                if (isResizing) {
+                    isResizing = false;
+                    document.body.style.cursor = '';
+                }
+            };
+            
+            document.addEventListener('mousemove', handleResize);
+            document.addEventListener('mouseup', stopResize);
+        }
+    }
+}
+
+export function deleteNode(nodeId) {
+    // Track deleted connections for incremental deploy. This must run
+    // synchronously BEFORE the connections are filtered out below - the old
+    // dynamic import ran as a microtask after the filter, so it always saw an
+    // empty result and deleted connections were never tracked.
+    disconnectImageViewerPreview(nodeId);
+    state.connections.forEach(c => {
+        if (c.source === nodeId || c.target === nodeId) {
+            markConnectionDeleted(c);
+        }
+    });
+
+    state.nodes.delete(nodeId);
+    state.connections = state.connections.filter(
+        c => c.source !== nodeId && c.target !== nodeId
+    );
+    
+    document.getElementById(`node-${nodeId}`)?.remove();
+    updateConnections();
+    
+    if (state.selectedNode === nodeId) {
+        import('./selection.js').then(({ deselectNode }) => deselectNode());
+    }
+    
+    // Track deleted node for incremental deploy
+    markNodeDeleted(nodeId);
+    setModified(true);
+}
+
+// Delete a node but reconnect the nodes on either side
+export function deleteNodeAndReconnect(nodeId) {
+    const nodeData = state.nodes.get(nodeId);
+    if (!nodeData) return;
+    
+    // Find all incoming connections (where this node is the target)
+    const incomingConnections = state.connections.filter(c => c.target === nodeId);
+    
+    // Find all outgoing connections (where this node is the source)
+    const outgoingConnections = state.connections.filter(c => c.source === nodeId);
+    
+    // Import createConnection to make the new connections
+    import('./connections.js').then(({ createConnection }) => {
+        // Connect each incoming source to each outgoing target
+        incomingConnections.forEach(incoming => {
+            outgoingConnections.forEach(outgoing => {
+                // Check if connection already exists
+                const exists = state.connections.some(c => 
+                    c.source === incoming.source && 
+                    c.target === outgoing.target &&
+                    c.sourceOutput === incoming.sourceOutput
+                );
+                
+                if (!exists) {
+                    createConnection(
+                        incoming.source,
+                        outgoing.target,
+                        incoming.sourceOutput,
+                        outgoing.targetInput || 0
+                    );
+                }
+            });
+        });
+        
+        // Now delete the node (which removes its connections)
+        deleteNode(nodeId);
+    });
+}
+
+export function updateNodeOutputCount(nodeId, outputCount) {
+    const nodeData = state.nodes.get(nodeId);
+    if (!nodeData) return;
+    
+    // Update the output count
+    nodeData.outputCount = outputCount;
+    
+    // Re-render the node
+    const nodeEl = document.getElementById(`node-${nodeId}`);
+    if (nodeEl) {
+        nodeEl.remove();
+        renderNode(nodeData);
+        updateConnections();
+    }
+}
+
+export function updateNodeInputCount(nodeId, inputCount) {
+    const nodeData = state.nodes.get(nodeId);
+    if (!nodeData) return;
+    
+    // Update the input count
+    nodeData.inputCount = inputCount;
+    
+    // Re-render the node
+    const nodeEl = document.getElementById(`node-${nodeId}`);
+    if (nodeEl) {
+        nodeEl.remove();
+        renderNode(nodeData);
+        updateConnections();
+    }
+}
+
+// Unified node action handler
+window.nodeAction = async function(nodeId, action, value) {
+    const isModeAction = ['set_mode', 'toggle_mode'].includes(action);
+    try {
+        // Handle different action types
+        if (action === 'inject') {
+            await fetch(`${API_BASE}/nodes/${nodeId}/inject`, { method: 'POST' });
+        } else if (action === 'toggle_gate') {
+            await window.toggleGate(nodeId, value);
+        } else if (action === 'toggle_debug') {
+            await window.toggleDebug(nodeId, value);
+        } else if (action === 'toggle_drawing') {
+            await window.toggleDrawPredictions(nodeId, value);
+        } else {
+            // Generic action - call the action endpoint. When a value is
+            // supplied (e.g. a seek target), send it as a JSON body so the
+            // backend action can receive it.
+            const options = { method: 'POST' };
+            let actionValue = value;
+            const nodeData = state.nodes.get(nodeId);
+            const toggle = document.getElementById(`toggle-${nodeId}`);
+            const previousModeA = nodeData ? nodeData.modeA !== false : true;
+            if (isModeAction && action === 'set_mode' && value !== undefined && toggle) {
+                // A checkbox changes its visual state before onchange runs. Keep
+                // the previous state until the password-protected request succeeds.
+                toggle.checked = previousModeA;
+            }
+            if (isModeAction && nodeData?.config?.password) {
+                const password = window.prompt('请输入模式切换密码');
+                if (password === null) return;
+                actionValue = action === 'set_mode'
+                    ? { mode: value, password }
+                    : { password };
+            }
+            if (actionValue !== undefined) {
+                options.headers = { 'Content-Type': 'application/json' };
+                options.body = JSON.stringify({ value: actionValue });
+            }
+            const response = await fetch(`${API_BASE}/nodes/${nodeId}/${action}`, options);
+            if (!response.ok) {
+                if (response.status === 403 && ['set_mode', 'toggle_mode'].includes(action)) {
+                    window.alert('密码错误，模式未切换');
+                }
+                throw new Error(`HTTP ${response.status}`);
+            }
+
+            if (isModeAction) {
+                const nodeData = state.nodes.get(nodeId);
+                if (nodeData) {
+                    const modeA = action === 'set_mode'
+                        ? Boolean(value)
+                        : nodeData.modeA === false;
+                    nodeData.modeA = modeA;
+                    nodeData.mode = modeA ? 'a' : 'b';
+                    const modeToggle = document.getElementById(`toggle-${nodeId}`);
+                    if (modeToggle) modeToggle.checked = modeA;
+                    const modeDisplay = document.getElementById(`mode-display-${nodeId}`);
+                    if (modeDisplay) modeDisplay.textContent = getModeLabel(nodeData, modeA);
+                }
+            }
+        }
+    } catch (error) {
+        if (isModeAction && value !== undefined) {
+            const nodeData = state.nodes.get(nodeId);
+            const modeToggle = document.getElementById(`toggle-${nodeId}`);
+            if (nodeData && modeToggle) modeToggle.checked = nodeData.modeA !== false;
+            const modeDisplay = document.getElementById(`mode-display-${nodeId}`);
+            if (nodeData && modeDisplay) modeDisplay.textContent = getModeLabel(nodeData, nodeData.modeA !== false);
+        }
+        console.error(`Failed to execute action ${action} on node ${nodeId}:`, error);
+    }
+};
+
+// Preview the video position label while dragging the progress slider.
+// Marks the slider as being scrubbed so incoming SSE position updates don't
+// fight the user's drag (see updateVideoPosition in debug.js).
+window.videoSeekPreview = function(nodeId, value) {
+    const sliderEl = document.getElementById(`transport-progress-${nodeId}`);
+    if (sliderEl) sliderEl.dataset.seeking = 'true';
+    const posEl = document.getElementById(`transport-pos-${nodeId}`);
+    if (posEl) {
+        const frame = parseInt(value, 10) || 0;
+        const max = sliderEl ? (parseInt(sliderEl.max, 10) || 0) : 0;
+        const total = max > 0 ? max + 1 : 0;
+        // Zero-pad to the total's digit count so the node width stays constant.
+        const current = frame + 1;
+        const currentText = total > 0
+            ? String(current).padStart(String(total).length, '0')
+            : String(current);
+        posEl.textContent = `${currentText}/${total > 0 ? total : '?'}`;
+    }
+};
+
+// Commit a seek when the user releases the progress slider.
+window.videoSeek = async function(nodeId, value) {
+    const sliderEl = document.getElementById(`transport-progress-${nodeId}`);
+    if (sliderEl) sliderEl.dataset.seeking = 'false';
+    await window.nodeAction(nodeId, 'seek', parseInt(value, 10) || 0);
+};
+
+// ControlSliderNode: push the live value to the deployed node while dragging.
+// Throttled so a drag doesn't flood the backend; the on-release commit always
+// sends the final value, so a skipped intermediate frame never sticks.
+const _controlSliderLastSent = {};
+window.controlSliderInput = function(nodeId, value) {
+    const valEl = document.getElementById(`slider-val-${nodeId}`);
+    if (valEl) valEl.textContent = value;
+    const now = performance.now();
+    if (now - (_controlSliderLastSent[nodeId] || 0) >= 40) {  // <= ~25 Hz
+        _controlSliderLastSent[nodeId] = now;
+        window.nodeAction(nodeId, 'set_value', parseFloat(value));
+    }
+};
+
+// Commit on release: guarantee the final value reaches the deployed node and
+// persist it to the node config so it saves with the workflow.
+window.controlSliderCommit = function(nodeId, value) {
+    const num = parseFloat(value);
+    const valEl = document.getElementById(`slider-val-${nodeId}`);
+    if (valEl) valEl.textContent = value;
+    window.nodeAction(nodeId, 'set_value', num);
+    if (window.updateNodeConfig) window.updateNodeConfig(nodeId, 'value', num);
+};
+
+// Toggle draw predictions enabled state
+window.toggleDrawPredictions = async function(nodeId, enabled) {
+    try {
+        // Call the toggle_drawing action on the backend
+        const response = await fetch(`${API_BASE}/nodes/${nodeId}/toggle_drawing`, {
+            method: 'POST'
+        });
+        
+        if (response.ok) {
+            const nodeData = state.nodes.get(nodeId);
+            if (nodeData) {
+                // Store the state in nodeData for persistence
+                nodeData.drawingEnabled = enabled;
+            }
+            
+            // Sync toggle in properties panel if it exists
+            syncPropertiesPanelToggle(nodeId, 'drawingEnabled', enabled);
+            
+            console.log(`Draw predictions ${enabled ? 'enabled' : 'disabled'} for node ${nodeId}`);
+        }
+    } catch (error) {
+        console.error('Failed to toggle draw predictions:', error);
+    }
+};
+
+/**
+ * Sync a toggle in the properties panel with the node's state.
+ * Called when a toggle on the node itself is changed.
+ * @param {string} nodeId - The node ID
+ * @param {string} stateField - The state field name (e.g., 'drawingEnabled')
+ * @param {boolean} enabled - The new state
+ */
+function syncPropertiesPanelToggle(nodeId, stateField, enabled) {
+    // Find any toggle in the properties panel with matching state field
+    const propToggles = document.querySelectorAll(`#properties-panel input[type="checkbox"][data-state-field="${stateField}"]`);
+    propToggles.forEach(toggle => {
+        if (toggle.id.includes(nodeId) && toggle.checked !== enabled) {
+            toggle.checked = enabled;
+        }
+    });
+}
+
+// Toggle debug node enabled state - delegates to toggleNodeState
+window.toggleDebug = async function(nodeId, enabled) {
+    // Use the consolidated toggleNodeState from properties.js
+    await window.toggleNodeState(nodeId, enabled);
+};
+
+// Trigger inject node
+window.triggerInject = async function(nodeId) {
+    try {
+        await fetch(`${API_BASE}/nodes/${nodeId}/inject`, { method: 'POST' });
+    } catch (error) {
+        console.error('Failed to trigger inject:', error);
+    }
+};
+
+// Upload an image file to an ImageUploadNode
+window.uploadImageToNode = async function(nodeId, file) {
+    try {
+        const formData = new FormData();
+        formData.append('file', file);
+
+        const response = await fetch(`${API_BASE}/nodes/${nodeId}/upload_image`, {
+            method: 'POST',
+            body: formData
+        });
+
+        const result = await response.json();
+        if (!result.success) {
+            console.error('Image upload failed:', result.error);
+        }
+    } catch (error) {
+        console.error('Failed to upload image to node:', error);
+    }
+};

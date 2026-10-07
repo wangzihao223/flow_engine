@@ -1,0 +1,210 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>PyNode - Visual Workflow Editor</title>
+    <link rel="icon" type="image/png" href="images/favicon4.png">
+    <link rel="stylesheet" href="style.css">
+</head>
+<body>
+    <div class="container">
+        <!-- Toast notification -->
+        <div id="toast" class="toast"></div>
+
+        <!-- Header -->
+        <header class="header">
+            <h1><img src="images/favicon4.png" alt="PyNode" class="header-logo">PyNode Editor<span id="app-version" class="app-version"></span></h1>
+            <div class="header-actions">
+                <div class="deploy-container">
+                    <button id="deploy-btn" class="btn btn-primary deploy-main" disabled>
+                        <span id="deploy-mode-icon" class="deploy-btn-icon">◐</span>
+                        Deploy
+                    </button>
+                    <button id="deploy-dropdown-btn" class="btn btn-primary deploy-arrow">▼</button>
+                    <div id="deploy-dropdown" class="deploy-dropdown hidden">
+                        <button id="deploy-modified-btn" class="menu-item deploy-option active">
+                            <span class="deploy-icon">◐</span>
+                            <span class="deploy-text">
+                                <span class="deploy-label">Modified Nodes</span>
+                                <span class="deploy-desc">Only deploy nodes that have changed</span>
+                            </span>
+                        </button>
+                        <button id="deploy-full-btn" class="menu-item deploy-option">
+                            <span class="deploy-icon">●</span>
+                            <span class="deploy-text">
+                                <span class="deploy-label">Full</span>
+                                <span class="deploy-desc">Deploy all nodes, restarting the entire flow</span>
+                            </span>
+                        </button>
+                        <div class="deploy-separator"></div>
+                        <button id="deploy-restart-btn" class="menu-item deploy-option">
+                            <span class="deploy-icon">↻</span>
+                            <span class="deploy-text">
+                                <span class="deploy-label">Restart</span>
+                                <span class="deploy-desc">Restart all nodes without redeploying</span>
+                            </span>
+                        </button>
+                        <button id="deploy-stop-btn" class="menu-item deploy-option">
+                            <span class="deploy-icon">■</span>
+                            <span class="deploy-text">
+                                <span class="deploy-label">Stop</span>
+                                <span class="deploy-desc">Stop processing; Deploy to start again</span>
+                            </span>
+                        </button>
+                    </div>
+                </div>
+                <div class="menu-container">
+                    <button id="menu-btn" class="btn btn-secondary" title="Menu">☰</button>
+                    <div id="menu-dropdown" class="menu-dropdown hidden">
+                        <button id="clear-btn" class="menu-item">Clear Workflow</button>
+
+                        <div class="menu-submenu">
+                            <button id="export-btn" class="menu-item submenu-toggle">◁ Export</button>
+                            <div id="export-submenu" class="submenu-dropdown hidden">
+                                <button id="export-flow-btn" class="menu-item">Flow</button>
+                                <button id="export-selected-btn" class="menu-item">Selected Nodes</button>
+                            </div>
+                        </div>
+
+                        <button id="import-btn" class="menu-item">Import</button>
+
+                        <div class="menu-submenu">
+                            <button id="examples-btn" class="menu-item submenu-toggle">◁ Examples</button>
+                            <div id="examples-submenu" class="submenu-dropdown examples-submenu hidden">
+                                <div id="examples-list" class="examples-list">
+                                    <div class="examples-placeholder">Loading…</div>
+                                </div>
+                            </div>
+                        </div>
+                    </div>
+                </div>
+            </div>
+        </header>
+
+        <!-- Main content -->
+        <div class="main-content">
+            <!-- Node Palette -->
+            <aside class="palette" id="left-palette">
+                <div class="palette-scroll">
+                    <h3>Node Palette</h3>
+                    <div class="palette-search-container">
+                        <input type="text" id="palette-search" class="palette-search" placeholder="Filter nodes..." />
+                        <button id="palette-clear-btn" class="search-clear-btn" aria-label="Clear search">✕</button>
+                    </div>
+                    <div id="node-palette" class="node-list">
+                        <!-- Nodes will be loaded here -->
+                    </div>
+                </div>
+                <div class="panel-grab panel-grab-left" id="left-palette-grab" title="Drag to resize">
+                    <button class="panel-toggle-btn" id="left-palette-toggle" type="button" aria-label="Toggle palette"></button>
+                </div>
+            </aside>
+
+            <!-- Canvas area with workflow tabs -->
+            <div class="canvas-area">
+                <!-- Workflow Tabs -->
+                <div class="workflow-tabs" id="workflow-tabs">
+                    <!-- Tabs are rendered dynamically -->
+                    <button class="workflow-tab-add" id="add-workflow-btn" title="New Workflow">+</button>
+                </div>
+
+                <!-- Canvas -->
+                <main class="canvas-container">
+                <!-- canvas-viewport is the zoom root: viewport.js applies
+                     transform: scale(k) here so the connections SVG and the
+                     HTML nodes layer zoom together -->
+                <div id="canvas-viewport">
+                    <svg id="canvas" width="100%" height="100%">
+                        <!-- <defs>
+                            <marker id="arrowhead" markerWidth="10" markerHeight="7"
+                                    refX="0" refY="3.5" orient="auto" markerUnits="strokeWidth">
+                                <polygon points="0 0, 10 3.5, 0 7" fill="#999" />
+                            </marker>
+                        </defs> -->
+                        <g id="connections"></g>
+                        <g id="temp-line"></g>
+                    </svg>
+                    <div id="nodes-container"></div>
+                </div>
+            </main>
+
+                <!-- Canvas overlay controls: minimap + zoom -->
+                <div class="canvas-controls" id="canvas-controls">
+                    <div id="minimap-panel" class="minimap-panel hidden">
+                        <canvas id="minimap-canvas" width="220" height="150"></canvas>
+                    </div>
+                    <div class="canvas-controls-bar">
+                        <button id="zoom-out-btn" class="canvas-ctrl-btn" title="Zoom out (Ctrl+wheel)">−</button>
+                        <button id="zoom-reset-btn" class="canvas-ctrl-btn zoom-readout" title="Reset zoom">100%</button>
+                        <button id="zoom-in-btn" class="canvas-ctrl-btn" title="Zoom in (Ctrl+wheel)">+</button>
+                        <button id="canvas-lock-btn" class="canvas-ctrl-btn" title="Lock canvas movement" aria-pressed="false">🔓</button>
+                        <button id="minimap-toggle-btn" class="canvas-ctrl-btn" title="Toggle minimap">▦</button>
+                    </div>
+                </div>
+            </div>
+
+            <!-- Properties Panel -->
+            <aside class="properties hidden" id="properties-panel-container">
+                <div class="resize-handle" id="properties-resize-handle"></div>
+                <div class="properties-header">
+                    <h3>Properties</h3>
+                    <button class="properties-close-btn" id="close-properties-btn" title="Close Properties">✕</button>
+                </div>
+                <div id="properties-panel">
+                    <p class="placeholder">Select a node to edit properties</p>
+                </div>
+            </aside>
+
+            <!-- Right Sidebar (permanent) -->
+            <aside class="right-sidebar" id="right-sidebar">
+                <div class="sidebar-tabs">
+                    <button class="sidebar-tab active" data-panel="debug" title="Debug">🐛</button>
+                    <button class="sidebar-tab" data-panel="info" title="Info">ℹ️</button>
+                </div>
+                <div class="sidebar-content">
+                    <!-- Debug Panel -->
+                    <div class="sidebar-panel active" id="debug-panel">
+                        <div class="debug-header">
+                            <h3>Debug Messages</h3>
+                            <div class="debug-controls">
+                                <button id="pause-debug-btn" class="btn btn-secondary btn-small icon-btn" title="Pause updates"></button>
+                                <button id="clear-debug-btn" class="btn btn-secondary btn-small" title="Clear">🗑️</button>
+                            </div>
+                        </div>
+                        <div class="debug-filters">
+                            <button class="filter-toggle-btn active" id="filter-info" data-filter="info">
+                                Info
+                            </button>
+                            <button class="filter-toggle-btn active" id="filter-errors" data-filter="errors">
+                                Errors
+                            </button>
+                            <button class="filter-toggle-btn" id="collapse-similar" data-filter="collapse">
+                                Collapse
+                            </button>
+                        </div>
+                        <div id="debug-messages"></div>
+                    </div>
+                    <!-- Info Panel -->
+                    <div class="sidebar-panel" id="info-panel">
+                        <div class="info-header">
+                            <h3>Information</h3>
+                        </div>
+                        <div class="info-content">
+                            <p class="placeholder">Select a node to see information</p>
+                        </div>
+                    </div>
+                </div>
+                <div class="panel-grab panel-grab-right" id="right-sidebar-grab" title="Drag to resize">
+                    <button class="panel-toggle-btn" id="right-sidebar-toggle" type="button" aria-label="Toggle sidebar"></button>
+                </div>
+            </aside>
+        </div>
+    </div>
+
+    <!-- auth.js must load first (classic script, runs during parse) so its
+         fetch wrapper covers every API call made by the module bundle -->
+    <script src="js/auth.js"></script>
+    <script type="module" src="js/main.js"></script>
+</body>
+</html>

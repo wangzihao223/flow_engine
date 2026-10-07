@@ -1,0 +1,32 @@
+{
+  "connections": [
+    {
+      "source": "source",
+      "sourceOutput": 0,
+      "target": "counter",
+      "targetInput": 0
+    }
+  ],
+  "nodes": [
+    {
+      "config": {
+        "increment": 2
+      },
+      "enabled": true,
+      "id": "counter",
+      "name": null,
+      "type": "CounterNode",
+      "x": null,
+      "y": null
+    },
+    {
+      "config": {},
+      "enabled": false,
+      "id": "source",
+      "name": null,
+      "type": "PassThroughNode",
+      "x": null,
+      "y": null
+    }
+  ]
+}

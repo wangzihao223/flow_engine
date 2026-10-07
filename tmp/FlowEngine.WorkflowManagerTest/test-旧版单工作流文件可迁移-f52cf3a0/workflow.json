@@ -1,0 +1,34 @@
+{
+  "activeWorkflow": "default",
+  "version": 2,
+  "workflows": [
+    {
+      "definition": {
+        "connections": [],
+        "nodes": [
+          {
+            "config": {},
+            "enabled": true,
+            "id": "old",
+            "name": null,
+            "type": "PassThroughNode",
+            "x": null,
+            "y": null
+          }
+        ]
+      },
+      "enabled": true,
+      "id": "default",
+      "name": "Default Workflow"
+    },
+    {
+      "definition": {
+        "connections": [],
+        "nodes": []
+      },
+      "enabled": true,
+      "id": "workflow-Rf8TD3sr3TVm",
+      "name": "Second"
+    }
+  ]
+}

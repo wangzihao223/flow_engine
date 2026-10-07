@@ -1,0 +1,9 @@
+{
+  "connections": [],
+  "nodes": [
+    {
+      "id": "old",
+      "type": "PassThroughNode"
+    }
+  ]
+}
